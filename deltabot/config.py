@@ -12,7 +12,8 @@ class Config(object):
         if isinstance(config_file, dict):
             self.attrs = config_file
         elif os.path.isfile(config_file):
-            self.attrs = json.load(open(config_file))
+            with open(config_file, 'r') as f:
+                self.attrs = json.load(f)
         else:
             self.attrs = json.loads(config_file)
 
