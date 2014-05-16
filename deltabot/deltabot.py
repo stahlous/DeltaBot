@@ -36,14 +36,16 @@ import datetime
 import traceback
 import collections
 import random
-
+from requests.exceptions import HTTPError
+import sqlite3 as lite
+import jinja2
 
 try:
     from HTMLParser import HTMLParser
 except ImportError:  # Python 3
     from html.parser import HTMLParser
 
-logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.INFO)
 
 def get_first_int(string):
     """ Returns the first integer in the string"""
@@ -170,6 +172,23 @@ class DeltaBot(object):
         self.changes_made = False
         self.minimum_comment_length = get_longest_token_length(self.config.tokens) + self.config.minimum_comment_length
 
+        self.to_update = set()
+
+        self.db = lite.connect(self.config.database)
+        self.db.row_factory = lite.Row
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS awards 
+                (submission_id text, submission_title text, submission_self_text text, submission_author text, submission_url text,
+                 awarded_comment_id text, awarded_comment_text text, awarded_comment_author text, awarded_comment_url text,
+                 awarding_comment_id text, awarding_comment_text text, awarding_comment_author text, awarding_comment_url text,
+                 awarding_comment_datetime timestamp)""")
+
+        with open(self.config['user_wiki_template'], 'r') as tmpl_file:
+            self.user_wiki_template = jinja2.Template(tmpl_file.read())
+        with open(self.config['monthly_scoreboard_template'], 'r') as tmpl_file:
+            self.monthly_scoreboard_template = jinja2.Template(tmpl_file.read())
+
     def send_first_time_message(self, recipient_name):
         first_time_message = self.config.private_message % (
             self.config.subreddit, recipient_name)
@@ -194,12 +213,29 @@ class DeltaBot(object):
 
     def award_points(self, awardee, comment):
         """ Awards a point. """
+        submission = comment.submission
+        parent = self.reddit.get_info(thing_id=comment.parent_id)
         logging.info("Awarding point to %s" % awardee)
-        self.adjust_point_flair(awardee)
-        self.update_monthly_scoreboard(awardee, comment)
-        self.update_wiki_tracker(comment)
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute("""INSERT INTO awards VALUES
+                (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?
+                )""", 
+                (
+                    submission.id, submission.title, submission.selftext, submission.author.name, submission.permalink,
+                    parent.id, parent.body, parent.author.name, parent.permalink,
+                    comment.id, comment.body, comment.author.name, comment.permalink,
+                    datetime.datetime.fromtimestamp(comment.created_utc)
+                )
+            )
+        self.db.commit()
+        self.to_update.add(parent.author.name)
 
-    def get_scoreboard_for_date(self,date):
+    def get_scoreboard_for_date(self, date):
         """ Return the scoreboard appropriate for the given date"""
         page_title = "scoreboard_%s_%s" % (date.year, date.month)
         try:
@@ -214,48 +250,25 @@ class DeltaBot(object):
     def get_this_months_scoreboard(self, date):
         return self.get_scoreboard_for_date(date)
 
-    def update_monthly_scoreboard(self, redditor, comment, num_points=1):
+    def update_monthly_scoreboard(self, year, month, awards):
         logging.info("Updating monthly scoreboard")
-        date = datetime.datetime.utcfromtimestamp(comment.created)
-        scoreboard = self.get_this_months_scoreboard(date)
-        page_title = "scoreboard_%s_%s" % (date.year, date.month)
-        if redditor in scoreboard:
-            entry = scoreboard[redditor]
-        else:
-            entry = scoreboard[redditor] = {"links": [], "score": 0}
-
-        entry["links"].append("[%s](%s)" % (comment.submission.title,
-                                            comment.permalink))
-        entry["score"] += num_points
-
+        awardee_awards = {}
+        for awardee in set([award['awarded_comment_author'] for award in awards]):
+            awardee_awards[awardee] = [award for award in awards if award['awarded_comment_author'] == awardee]
+        new_content = self.monthly_scoreboard_template.render(awardee_awards=awardee_awards)
+        page_title = "scoreboard_%s_%s" % (year, month)
         self.reddit.edit_wiki_page(self.config.subreddit, page_title,
-                                   scoreboard_to_markdown(scoreboard),
-                                   "Updating monthly scoreboard")
+            new_content, "Updating monthly scoreboard")
 
-    def adjust_point_flair(self, redditor, num_points=1):
-        """ Recalculate a user's score and update flair. """
-        self.changes_made = True
+    def adjust_point_flair(self, awardee, num):
+        """ Update flair. """
+        css_class = self.config.flair['css_class']
+        current_flair = self.subreddit.get_flair(awardee)
+        if current_flair:
+            if self.config.flair['css_class'] not in current_flair:
+                css_class = current_flair + ' ' + self.config.flair['css_class']
 
-        flair = self.subreddit.get_flair(redditor)
-        if flair['flair_text'] == None:
-            points = 0
-            css_class = ''
-            self.send_first_time_message(redditor)
-        elif flair:
-            points = get_first_int(flair['flair_text'])
-            css_class = flair['flair_css_class']
-        else:
-            points = 0
-            css_class = ''
-            self.send_first_time_message(redditor)
-
-        points += num_points
-        if self.config.flair['css_class'] not in css_class:
-            css_class += ' ' + self.config.flair['css_class']
-
-        self.subreddit.set_flair(redditor,
-                                 self.config.flair['point_text'] % points,
-                                 css_class)
+        self.subreddit.set_flair(awardee, self.config.flair['point_text'] % num, css_class)
 
     def is_comment_too_short(self, comment):
         return len(comment.body) < self.minimum_comment_length
@@ -321,6 +334,7 @@ class DeltaBot(object):
             comment.author.name if comment.author else "[deleted]"))
 
         message = None
+        print(comment.body)
         if str_contains_token(comment.body, self.config.tokens) or not strict:
             parent_author = str(parent.author.name).lower()
             comment_author = str(comment.author.name).lower()
@@ -500,12 +514,10 @@ class DeltaBot(object):
     def scan_mod_mail(self):
         pass
 
-    def update_top_ten_css(self):
+    def update_top_ten_css(self, top_scores):
         """ Update the flair css for the top ten users """
-        today = datetime.datetime.utcnow()
         top_1_css = self.config.flair['top1']
         top_10_css = self.config.flair['top10']
-        top_scores = self.get_top_ten_scores_for_date(today)
 
         ### Remove special css classes from last month
         last_month = datetime.datetime(day=1,month=today.month,year=today.year) - datetime.timedelta(days=1)
@@ -515,11 +527,6 @@ class DeltaBot(object):
             flair = self.subreddit.get_flair(redditor)
             flair_text = flair['flair_text']
             current_css = flair['flair_css_class']
-            print(redditor)
-            print(flair)
-            print(flair_text)
-            print(current_css)
-            stuff = raw_input("Wait")
             new_css = current_css.replace(top_1_css, '').replace(top_10_css, '').strip()
             self.subreddit.set_flair(redditor,flair_text=flair_text,flair_css_class=new_css)
 
@@ -619,150 +626,58 @@ class DeltaBot(object):
         date = datetime.datetime.utcnow()
         return get_top_ten_scores_for_date(date)
 
-    def update_wiki_tracker(self, comment):
-        """ Update wiki page of person earning the delta
+    def update_wiki_tracker(awardee, awards):
+        awarded_comments = []
+        for awarded_comment_id in set([award['awarded_comment_id']
+                for award in awards]):
+            awards_for_comment = [award for award in awards if 
+                award['awarded_comment_id'] == awarded_comment_id]
+            awarded_comment = {key: awards_for_comment[0][key] for key in 
+                awards_for_comment[0].keys() if 'awarding' not in key}
+            awarded_comment['awarding_comments'] = 
+                [{key.replace('awarding_comment_', ''): award_for_comment[key] 
+                for key in award_for_comment.keys() if 'awarding' in key} for 
+                award_for_comment in awards_for_comment]
+            awarded_comment['awarding_comments'].sort(key=lambda x: datetime.datetimx[''])
+            awarded_comments.append(awarded_comment)
 
-            Note: comment passed in is the comment awarding the delta,
-            parent comment is the one earning the delta
-        """
-        logging.info("Updating wiki")
+        new_content = self.user_wiki_template.render(awarde=awardee, 
+            num_awards=len(awards), awarded_comments=awarded_comments)
+        self.reddit.edit_wiki_page(self.config.subreddit, "user/" + awardee, 
+            new_content, "Updated awards.")
 
-        comment_url = comment.permalink
-        submission_url = comment.submission.permalink
-        submission_title = comment.submission.title
-        parent = self.reddit.get_info(thing_id=comment.parent_id)
-        parent_author = parent.author.name
-        author_flair = str(self.subreddit.get_flair(parent_author))
-        author_flair = re.search("(flair_text': u')(\d*)", author_flair)
-        flair_count = "0 deltas"
-        if author_flair:
-            flair_count = author_flair.group(2)
-            if flair_count == "1":
-                flair_count = "1 delta"
-            else:
-                flair_count += " deltas"
-        awarder_name = comment.author.name
-        today = datetime.date.today()
+    def fetch_awards_by_awardee(self, awardee):
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute('''SELECT * FROM awards WHERE 
+                awarded_comment_author=?''', (awardee,))
+            awards = cur.fetchall()
+        for award in awards:
+            award['awarding_comment_datetime'] = 
+                datetime.datetime.strptime(award['awarding_comment_datetime'], 
+                '%Y-%m-%d %H:%M:%S')
+        return awards
 
-        # try to get wiki page for user, throws exception if page doesn't exist
-        try:
-            user_wiki_page = self.reddit.get_wiki_page(self.config.subreddit,
-                                                       "user/" + parent_author)
+    def fetch_awards_by_month(self, year, month):
+        next_month = (month + 1) if (month < 12) else 1
+        next_year = year if (next_month > 1) else (year + 1)
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute('''SELECT * FROM awards WHERE 
+                (awarding_comment_datetime >= ? 
+                AND awarding_comment_datetime < ?)''', 
+                (datetime.datetime(year, month, 1, 0, 0, 0), 
+                 datetime.datetime(next_year, next_month, 1, 0, 0, 0)))
+            awards = cur.fetchall()
+        for award in awards:
+            award['awarding_comment_datetime'] = 
+                datetime.datetime.strptime(award['awarding_comment_datetime'], 
+                '%Y-%m-%d %H:%M:%S')
+        return awards
 
-            # get old wiki page content as markdown string, and unescaped any
-            # previously escaped HTML characters
-            old_content = HTMLParser().unescape(user_wiki_page.content_md)
-
-            # Alter how many deltas is in the first line
-            try:
-                old_content = re.sub("([0-9]+) delta[s]?", flair_count,
-                                     old_content)
-            except:
-                print("The 'has received' line in the wiki has failed to update.")
-            # compile regex to search for current link formatting
-            # only matches links that are correctly formatted, so will not be
-            # broken by malformed or links made by previous versions of DeltaBot
-            regex = re.compile("\\* \\[%s\\]\\(%s\\) \\(\d+\\)" % (
-                re.escape(submission_title), re.escape(submission_url)
-            ))
-            # search old page content for link
-            old_link = regex.search(old_content)
-
-            # variable for updated wiki content
-            new_content = ""
-
-            # old link exists, only increase number of deltas for post
-            if old_link:
-                # use re.sub to increment number of deltas in link
-                new_link = re.sub(
-                    "\((\d+)\)",
-                    lambda match: "(" + str(int(match.group(1)) + 1) + ")",
-                    old_link.group(0)
-                )
-
-                # insert link to new delta
-                new_link += "\n    1. [Awarded by /u/%s](%s) on %s/%s/%s" % (
-                    awarder_name, comment_url + "?context=2",
-                    today.month, today.day, today.year
-                )
-
-                #use re.sub to replace old link with new link
-                new_content = re.sub(regex, new_link, old_content)
-
-            # no old link, create old link with initial count of 1
-            else:
-                # create link and format as markdown list item
-                # "?context=2" means link shows comment earning the delta and
-                # the comment awarding it
-                # "(1)" is the number of deltas earned from that comment
-                # (1 because this is the first delta the user has earned)
-                add_link = "\n\n* [%s](%s) (1)\n    1. [Awarded by /u/%s](%s) on %s/%s/%s" % (submission_title,
-                                                                                              submission_url,
-                                                                                              awarder_name,
-                                                                                              comment_url + "?context=2",
-                                                                                              today.month,
-                                                                                              today.day,
-                                                                                              today.year)
-
-                # get previous content as markdown string and append new content
-                new_content = user_wiki_page.content_md + add_link
-
-            # overwrite old content with new content
-            self.reddit.edit_wiki_page(self.config.subreddit,
-                                       user_wiki_page.page,
-                                       new_content,
-                                       "Updated delta links.")
-
-        # if page doesn't exist, create page with initial content
-        except:
-
-            # create header for new wiki page
-            initial_text = "/u/%s has received 1 delta for the following comments:" % parent_author
-
-            # create link and format as markdown list item
-            # "?context=2" means link shows comment earning the delta and the comment awarding it
-            # "(1)" is the number of deltas earned from that comment
-            # (1 because this is the first delta the user has earned)
-            add_link = "\n\n* [%s](%s) (1)\n    1. [Awarded by /u/%s](%s) on %s/%s/%s" % (submission_title,
-                                                                                          submission_url,
-                                                                                          awarder_name,
-                                                                                          comment_url + "?context=2",
-                                                                                          today.month, today.day,
-                                                                                          today.year)
-
-            # combine header and link
-            full_update = initial_text + add_link
-
-            # write new content to wiki page
-            self.reddit.edit_wiki_page(self.config.subreddit,
-                                       "user/" + parent_author,
-                                       full_update,
-                                       "Created user's delta links page.")
-
-            """Add new awardee to Delta Tracker wiki page"""
-
-            # get delta tracker wiki page
-            delta_tracker_page = self.reddit.get_wiki_page(
-                self.config.subreddit,
-                "delta_tracker")
-
-            # retrieve delta tracker page content as markdown string
-            delta_tracker_page_body = delta_tracker_page.content_md
-
-            # create link to user's wiki page as markdown list item
-            new_link = "\n\n* /u/%s -- [Delta List](/r/%s/wiki/%s)" % (
-                parent_author,
-                self.config.subreddit,
-                parent_author)
-
-            # append new link to old content
-            new_content = delta_tracker_page_body + new_link
-
-            # overwrite old page content with new page content
-            self.reddit.edit_wiki_page(self.config.subreddit,
-                                       "delta_tracker",
-                                       new_content,
-                                       "Updated tracker page.")
+    def find_top_n(self, awards, n):
+        return collections.Counter([award['awarded_comment_author'] 
+            for award in awards]).most_common(n)
 
     def go(self):
         """ Start DeltaBot. """
@@ -772,17 +687,29 @@ class DeltaBot(object):
             old_comment_id = self.scanned_comments[-1] if self.scanned_comments else None
             logging.info("Starting iteration at %s" % old_comment_id or "None")
 
-            try:
-                self.scan_inbox()
-                self.scan_mod_mail()
-                self.scan_comments()
-                if self.changes_made:
-                    self.update_scoreboard()
-            except:
-                print("Exception in user code:")
-                print('-' * 60)
-                traceback.print_exc(file=sys.stdout)
-                print('-' * 60)
+                # self.scan_inbox()
+                # self.scan_mod_mail()
+            self.scan_comments()
+            if self.changes_made:
+                self.update_scoreboard()
+
+            while self.to_update:
+                awardee = self.to_update.pop()
+                awardee_awards = fetch_awards_by_awardee(awardee)
+
+                num = len(awardee_awards)
+                if num == 1:
+                    self.send_first_time_message(awardee)
+                self.adjust_point_flair(awardee, num)
+                self.update_wiki_tracker(awardee, awardee_awards)
+
+                if len(self.to_update) == 0:
+                    now = datetime.datetime.now()
+                    monthly_awards = self.fetch_awards_by_month(now.year, now.month)
+                    self.update_monthly_scoreboard(now.year, now.month, monthly_awards)
+                    top10 = self.find_top_n(monthly_awards, 10)
+                    self.update_top_ten_css(top10)
+                    self.update_scoreboard(top10)
 
             if self.scanned_comments and old_comment_id is not self.scanned_comments[-1]:
                 write_saved_id(self.config.last_comment_filename,
