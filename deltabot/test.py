@@ -200,9 +200,11 @@ class TestScanComment(DeltaBotTestCase):
         self.assertEqual(log, "No points awarded, already awarded", 
             "Did not properly recognize an award to descendent: %s" % log)
    
+    @mock.patch('deltabot.datetime', autospec=True)
     @mock.patch('deltabot.logging', autospec=True)
-    def test_comment_is_too_short(self, mock_logging):
+    def test_comment_is_too_short(self, mock_logging, mock_datetime):
         """ 2.6 - The comment is too short"""
+        self.bot.db = mock.MagicMock(spec=self.bot.db)
         self.comment.body = self.comment.body[10:] + test_config.tokens[0]
         test_messages = [(msg + test_config.messages['append_to_all_messages']) 
             % self.parent.author for msg in test_config.messages['too_little_text']]
@@ -301,5 +303,67 @@ class TestIsCommentTooShort(DeltaBotTestCase):
         result = self.bot.is_comment_too_short(long_comment)
         self.assertFalse(result, "is_comment_too_short() returns True with long comment")
 
+class TestUpdateTopCSS(DeltaBotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bot.clear_leader_flair_css = mock.create_autospec(self.bot.clear_leader_flair_css)
+
+    def test_no_leaders(self):
+        leaders = []
+        
+        self.bot.update_top_css(leaders)
+        
+        self.assertFalse(self.bot.subreddit.set_flair.called, "attempted to set flair even though leaders list was empty")
+
+    def test_list_of_already_flaired_leaders(self):
+        leaders = ['amy', 'bob', 'carl', 'dina']
+        self.bot.subreddit.get_flair.return_value = {
+            'flair_text': 'some flair text', 
+            'flair_css_class': 'flairclass', 
+            'user': 'someone' }
+
+        self.bot.update_top_css(leaders)
+
+        self.assertEqual(self.bot.subreddit.set_flair.call_count, len(leaders), 'css not updated for all leaders in list')
+        for i, call_args in enumerate(self.bot.subreddit.set_flair.call_args_list):
+            self.assertEqual(call_args[0][0], leaders[i])
+            if i == 0:
+                self.assertEqual(call_args[1], {'flair_text': 'some flair text', 'flair_css_class': 'flairclass ' + self.bot.config.flair['top1']})
+            else:
+                self.assertEqual(call_args[1], {'flair_text': 'some flair text', 'flair_css_class': 'flairclass ' + self.bot.config.flair['top10']})
+
+    def test_list_of_unflaired_leaders(self):
+        leaders = ['amy', 'bob', 'carl', 'dina']
+        self.bot.subreddit.get_flair.return_value = {
+            'flair_text': None, 
+            'flair_css_class': None, 
+            'user': 'someone' }
+
+        self.bot.update_top_css(leaders)
+
+        self.assertEqual(self.bot.subreddit.set_flair.call_count, len(leaders), 'css not updated for all leaders in list')
+        for i, call_args in enumerate(self.bot.subreddit.set_flair.call_args_list):
+            self.assertEqual(call_args[0][0], leaders[i])
+            if i == 0:
+                self.assertEqual(call_args[1], {'flair_text': None, 'flair_css_class': self.bot.config.flair['top1']})
+            else:
+                self.assertEqual(call_args[1], {'flair_text': None, 'flair_css_class': self.bot.config.flair['top10']})
+
+class TestAdjustPointFlair(DeltaBotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bot.subreddit.get_flair.return_value = {
+            'flair_text': 'some flair text', 
+            'flair_css_class': 'flairclass', 
+            'user': 'someone' }
+
+    def test_adding_points(self):
+        self.bot.adjust_point_flair('someone', 5)
+
+        self.assertEqual(self.bot.subreddit.set_flair.call_args[0][:2], ('someone', self.bot.config.flair['point_text'] % 5))
+        self.assertIn(self.bot.config.flair['css_class'], self.bot.subreddit.set_flair.call_args[0][2])
+
 if __name__ == '__main__':
     unittest.main()
+
+
