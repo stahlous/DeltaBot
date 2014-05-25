@@ -129,7 +129,6 @@ class DeltaBot(object):
         self.config = config
         self.running = False
         self.reddit = reddit
-        # self.reddit.http.proxies = {'https': 'https://proxy-us.intel.com:911/', 'http': 'http://proxy-us.intel.com:912/'}
 
         logging.info('Connecting to reddit...')
         self.reddit.login(self.config.account['username'], self.config.account['password'])
