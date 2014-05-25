@@ -26,6 +26,7 @@
 from __future__ import print_function
 
 import re
+import os
 import sys
 import time
 import praw
@@ -38,11 +39,30 @@ import random
 from requests.exceptions import HTTPError
 import sqlite3 as lite
 import jinja2
+from operator import itemgetter
 
 try:
     from HTMLParser import HTMLParser
 except ImportError:  # Python 3
     from html.parser import HTMLParser
+
+import db
+
+dispos = {
+    'confirmed': 0,
+    'comment_does_not_contain_token': 1,
+    'comment_author_is_me': 2,
+    'parent_author_is_me':3,
+    'author_awarded_self': 4,
+    'awarded_op': 5,
+    'too_little_text': 6,
+    'already_awarded_by_bot': 7,
+    'already_awarded_in_this_tree': 8
+}
+
+rescannable_dispos = dispos['too_little_text'],
+trivial_dispos = (dispos['comment_author_is_me'], 
+                  dispos['comment_does_not_contain_token'])
 
 logging.getLogger('requests').setLevel(logging.INFO)
 
@@ -85,12 +105,6 @@ def read_saved_id(filename):
     except IOError:
         return None
 
-def login_to_reddit(reddit, config):
-    """
-    Logs into reddit with the given config.
-    """
-    return reddit.login(config.account['username'], config.account['password'])
-
 def get_longest_token_length(tokens):
     """
     Returns the length of the longest token within an iterable.
@@ -100,23 +114,29 @@ def get_longest_token_length(tokens):
         return 0
     return len(max(tokens, key=lambda t: len(t)))
 
+def load_templates(path):
+    templates = {}
+    root, dirs, fns = next(os.walk(path))
+    for fn in fns:
+        with open(os.path.join(path, fn), 'r', encoding='utf-8') as f:
+            templates[os.path.splitext(fn)[0]] = jinja2.Template(f.read())
+    for d in dirs:
+        templates[d] = load_templates(os.path.join(path, d))
+    return templates
+
 class DeltaBot(object):
     def __init__(self, config, reddit):
         self.config = config
         self.running = False
         self.reddit = reddit
-        # self.reddit.http.proxies = {
-        #     'https': 'https://proxy-us.intel.com:911/',
-        #     'http': 'http://proxy-us.intel.com:912/'
-        # }
+        # self.reddit.http.proxies = {'https': 'https://proxy-us.intel.com:911/', 'http': 'http://proxy-us.intel.com:912/'}
 
         logging.info('Connecting to reddit...')
-        login_to_reddit(self.reddit, self.config)
+        self.reddit.login(self.config.account['username'], self.config.account['password'])
         logging.info("Logged in as %s" % self.config.account['username'])
 
         self.subreddit = self.reddit.get_subreddit(self.config.subreddit)
-        self.comment_id_regex = '(?:http://)?(?:www\.)?reddit\.com/r(?:eddit)?/' + \
-                                self.config.subreddit + '/comments/[\d\w]+(?:/[^/]+)/?([\d\w]+)'
+
         self.scanned_comments = collections.deque([], 10)
 
         most_recent_comment_id = read_saved_id(self.config.last_comment_filename)
@@ -125,41 +145,31 @@ class DeltaBot(object):
             self.scanned_comments.append(most_recent_comment_id)
 
         self.minimum_comment_length = get_longest_token_length(self.config.tokens) + self.config.minimum_comment_length
+        self.db = db.DatabaseManager(self.config.database)
+        self.templates = load_templates('./config/templates')
 
-        self.to_update = set()
+        self.awarded_comments = []
 
-        self.db = lite.connect(self.config.database)
-        self.db.row_factory = lite.Row
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute("""CREATE TABLE IF NOT EXISTS awards 
-                (submission_id text, submission_title text, submission_self_text text, 
-                    submission_author text, submission_url text, submission_datetime timestamp,
-                 awarded_comment_id text, awarded_comment_text text, awarded_comment_author text, 
-                    awarded_comment_url text, awarded_comment_datetime timestamp,
-                 awarding_comment_id text, awarding_comment_text text, awarding_comment_author text, 
-                    awarding_comment_url text, awarding_comment_datetime timestamp)""")
-
-            cur.execute("""CREATE TABLE IF NOT EXISTS rescannable 
-                (comment_id text, comment_datetime timestamp)""")
-
-        with open(self.config['user_wiki_template'], 'r') as tmpl_file:
-            self.user_wiki_template = jinja2.Template(tmpl_file.read())
-        with open(self.config['monthly_scoreboard_template'], 'r') as tmpl_file:
-            self.monthly_scoreboard_template = jinja2.Template(tmpl_file.read())
-        with open(self.config['scoreboard_template'], 'r') as tmpl_file:
-            self.scoreboard_template = jinja2.Template(tmpl_file.read())
+    def climb_up(self, comment):
+        if comment.is_root:
+            return comment
+        else:
+            parent = self.reddit.get_info(thing_id=comment.parent_id)
+            return self.climb_up(parent)
 
     def send_first_time_message(self, awardee):
         first_time_message = self.config.private_message % (self.config.subreddit, awardee)
         self.reddit.send_message(awardee,
             self.config.private_message_subject_line, first_time_message)
 
-    def get_message(self, message_key):
-        """ Given a type of message select one of the messages from the
-        configuration at random. """
-        messages = self.config.messages[message_key]
-        return random.choice(messages) + self.config.messages['append_to_all_messages']
+    def get_reply_text(self, comment, dispo, parent_comment=None):
+        """ Replies to a comment with the type of message specified """
+        if parent_comment is None:
+            parent_comment = self.reddit.get_info(thing_id=comment.parent_id)
+        dispo_code = next((k for k, v in dispos.items() if v == dispo), None)
+        msg = self.templates['replies'][dispo_code].render(comment=comment, 
+            parent_comment=parent_comment, config=self.config)
+        return msg
 
     def string_matches_message(self, string, message_key, *args):
         messages = self.config.messages[message_key]
@@ -170,38 +180,18 @@ class DeltaBot(object):
                 return True
         return False
 
-    def award_points(self, awardee, comment):
+    def award_point(self, awarded_comment, awarding_comment):
         """ Awards a point. """
-        submission = comment.submission
-        parent = self.reddit.get_info(thing_id=comment.parent_id)
-        logging.info("Awarding point to %s" % awardee)
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute("""INSERT INTO awards VALUES
-                (
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
-                )""", 
-                (
-                    submission.id, submission.title, submission.selftext, 
-                        submission.author.name, submission.permalink, 
-                        datetime.fromtimestamp(submission.created_utc),
-                    parent.id, parent.body, parent.author.name, parent.permalink, 
-                        datetime.fromtimestamp(parent.created_utc),
-                    comment.id, comment.body, comment.author.name, comment.permalink,
-                        datetime.fromtimestamp(comment.created_utc)
-                )
-            )
-        self.db.commit()
-        self.to_update.add(parent.author.name)
+        logging.info("Awarding point to {}".format(awarded_comment.author.name))
+        self.db.award_point(awarded_comment, awarding_comment)
+        self.awarded_comments += awarded_comment
 
     def update_monthly_scoreboard(self, year, month, awards):
         logging.info("Updating monthly scoreboard")
         awardee_awards = {}
         for awardee in set([award['awarded_comment_author'] for award in awards]):
             awardee_awards[awardee] = [award for award in awards if award['awarded_comment_author'] == awardee]
-        new_content = self.monthly_scoreboard_template.render(awardee_awards=awardee_awards)
+        new_content = self.templates['monthly_scoreboard'].render(awardee_awards=awardee_awards)
         page_title = "scoreboard_%s_%s" % (year, month)
         self.reddit.edit_wiki_page(self.config.subreddit, page_title,
             new_content, "Updating monthly scoreboard")
@@ -212,113 +202,13 @@ class DeltaBot(object):
         current_flair = self.subreddit.get_flair(awardee)
         if current_flair['flair_css_class']:
             if self.config.flair['css_class'] not in current_flair['flair_css_class']:
-                css_class = " ".join(filter(None, [current_flair['flair_css_class'], self.config.flair['css_class']]))
+                css_class = " ".join(filter(None, 
+                    [ current_flair['flair_css_class'], 
+                      self.config.flair['css_class'] ]))
         else:
             css_class = self.config.flair['css_class']
 
         self.subreddit.set_flair(awardee, self.config.flair['point_text'] % num, css_class)
-
-    def is_comment_too_short(self, comment):
-        return len(comment.body) < self.minimum_comment_length
-
-    def already_replied(self, comment):
-        """ Returns true if Deltabot has replied to this comment """
-
-        # Needed in order to refresh comments
-        replies = self.reddit.get_submission(comment.permalink).comments[0].replies
-
-        message = self.get_message('confirmation')  # is this a bug? get_message randomly chooses a message - not guaranteed to be the same each time
-        msg = str(message)[:15]
-        me = self.config.account['username'].lower()
-        for reply in replies:
-            if str(reply.author.name).lower() == me:
-                if msg in str(reply):
-                    return True
-                else:
-                    reply.delete()  # not sure if this is a good place for this side effect
-                    return False    # what if DeltaBot happened to reply twice?
-        else:                       # might be better do this explicitly elsewhere
-            return False
-
-    def is_parent_commenter_author(self, comment, parent):
-        """ Returns true if the author of the parent comment the submitter """
-        comment_author = parent.author
-        post_author = comment.submission.author
-        return comment_author == post_author
-
-    def points_awarded_to_children(self, awardee, comment, confirm_msg=None, me=None):
-        """ Returns True if the OP awarded a delta to this comment or any of its
-        children, by looking for confirmation messages from this bot. """
-
-        if confirm_msg is None:
-            confirm_msg = (self.get_message('confirmation')
-                           % (awardee, self.config.subreddit, awardee))
-        if me is None:
-            me = self.config["account"]["username"]
-
-        # If this is a confirmation message, return True now
-        if comment.author == me and confirm_msg in comment.body:
-            return True
-        # Otherwise, recurse
-        for reply in comment.replies:
-            if self.points_awarded_to_children(awardee, reply, confirm_msg, me):
-                return True
-        return False
-
-    def points_already_awarded_to_ancestor(self, comment, parent):
-        awardee = parent.author
-        # First, traverse to root comment
-        root = parent
-        while not root.is_root:
-            root = self.reddit.get_info(thing_id=root.parent_id)
-        # Then, delegate to the recursive function above
-        return self.points_awarded_to_children(awardee, root)
-
-    def scan_comment(self, comment, strict=True):
-        parent = self.reddit.get_info(thing_id=comment.parent_id)
-
-        logging.info("Scanning comment reddit.com/r/%s/comments/%s/c/%s by %s" %
-            (self.config.subreddit, comment.submission.id, comment.id,
-            comment.author.name if comment.author else "[deleted]"))
-
-        message = None
-        if str_contains_token(comment.body, self.config.tokens) or not strict:
-            parent_author = str(parent.author.name).lower()
-            comment_author = str(comment.author.name).lower()
-            me = self.config.account['username'].lower()
-            if parent_author == me:
-                logging.info("No points awarded, replying to DeltaBot")
-
-            elif parent_author == comment_author:
-                logging.info("No points awarded, user replied to self")
-
-            elif self.already_replied(comment):
-                logging.info("No points awarded, already replied")
-
-            elif strict and self.is_parent_commenter_author(comment, parent):
-                logging.info("No points awarded, parent is OP")
-                message = self.get_message('broken_rule')
-
-            elif strict and self.points_already_awarded_to_ancestor(comment, parent):
-                logging.info("No points awarded, already awarded")
-                message = self.get_message('already_awarded') % parent.author
-
-            elif strict and self.is_comment_too_short(comment):
-                logging.info("No points awarded, too short")
-                message = self.get_message('too_little_text') % parent.author
-                with self.db:
-                    cur = self.db.cursor()
-                    cur.execute("""INSERT INTO rescannable VALUES (?, ?)""", 
-                        (comment.id, datetime.fromtimestamp(comment.created_utc)))
-            else:
-                self.award_points(parent.author.name, comment)
-                message = self.get_message('confirmation') % (parent.author,
-                    self.config.subreddit, parent.author)
-        else:
-            logging.info("No points awarded, comment does not contain Delta") 
-        
-        if message:
-            comment.reply(message).distinguish()
 
     def get_most_recent_comment(self):
         """Finds the most recently scanned comment,
@@ -339,25 +229,140 @@ class DeltaBot(object):
 
         return most_recent_comment_id
 
+    def already_awarded_in_this_tree(self, awarding_comment, awarded_comment=None):
+        if awarded_comment is None:
+            awarded_comment = self.reddit.get_info(thing_id=awarding_comment.parent_id)
+
+        # first see if there's already a record of an award being given
+        previous_awards = self.db.previous_awards_in_submission(awarded_comment, awarding_comment)
+
+        # if nothing was found, then we're good to go
+        if not previous_awards:
+            return False
+
+        # otherwise, check if the any of the previous awards come from the same root comment.
+        else:
+            awarded_comment_root = self.climb_up(awarded_comment)
+            for previous_award in previous_awards:
+                previous_awarding_comment = self.reddit.get_info(
+                    thing_id='t1_'+previous_award['awarding_comment_id'])
+                if self.climb_up(previous_awarding_comment).id == awarded_comment_root.id:
+                    return True
+        return False
+
+    def already_awarded_by_bot(self, comment):
+        return self.db.already_awarded_by_bot(comment)
+
+    def dispo_comment(self, comment, strict=True):
+        if not str_contains_token(comment.body, self.config.tokens) and strict:
+            logging.info('String does not contain an award token')
+            dispo = dispos['comment_does_not_contain_token']
+            parent = None
+        else:
+            parent = self.reddit.get_info(thing_id=comment.parent_id)
+            parent_author = parent.author.name
+            comment_author = comment.author.name
+            me = self.config.account['username']
+            op = comment.submission.author.name
+
+            if comment_author == me:
+                logging.info("Reply was from {}".format(me))
+                dispo = dispos['comment_author_is_me']
+
+            elif parent_author == me:
+                logging.info("Reply was to {}".format(me))
+                dispo = dispos['parent_author_is_me']
+
+            elif parent_author == comment_author:
+                logging.info("Comment author attempted to award self")
+                dispo = dispos['author_awarded_self']
+
+            elif parent_author == op:
+                logging.info("Comment author attempted to award OP")
+                dispo = dispos['awarded_op']
+
+            elif strict and len(comment.body) < self.minimum_comment_length:
+                logging.info("Comment was too short")
+                dispo = dispos['too_little_text']
+
+            elif self.already_awarded_by_bot(comment):
+                logging.info("Award has already been given for this comment")
+                dispo = dispos['already_awarded_by_bot']
+
+            elif strict and self.already_awarded_in_this_tree(comment, parent):
+                logging.info("Comment author already awarded parent comment author in this comment tree")
+                dispo = dispos['already_awarded_in_this_tree']
+
+            else:
+                logging.info("Comment meets criteria for awarding a point")
+                dispo = dispos['confirmed']
+
+        return dispo, parent
+
+    def process_comment(self, comment, strict=True):
+        logging.info("Processing comment {} by {}".format(
+            comment.permalink, comment.author.name))
+
+        dispo, parent = self.dispo_comment(comment, strict)
+
+        prev_dispo_log = self.db.fetch_dispo_log_by_comment(comment)
+        if not prev_dispo_log:
+            if dispo not in trivial_dispos:
+                reply = comment.reply(self.get_reply_text(comment, dispo, parent))
+                reply.distinguish()
+                self.db.log_dispo(comment, dispo, reply)
+                if dispo == dispos['confirmed']:
+                    self.award_point(parent, comment)
+        else:
+            if dispo != prev_dispo_log['dispo']:
+                bots_reply = self.reddit.get_info(
+                    thing_id=('t1_'+prev_dispo_log['reply_id']))
+                if dispo in trivial_dispos:
+                    bots_reply.delete()
+                    self.db.delete_dispo_log(comment)
+                else:
+                    if dispo != dispos['already_awarded_by_bot']:
+                        bots_reply.edit(self.get_reply_text(comment, dispo, parent))
+                        self.db.log_dispo(comment, dispo, bots_reply)
+                        if dispo == dispos['confirmed']:
+                            self.award_point(parent, comment)            
+        
     def scan_comments(self):
-        """ Scan a given list of comments for tokens. If a token is found,
+        """ Pull the most recent comments and search them for award tokens. If a token is found,
         award points. """
         logging.info("Scanning new comments")
 
-        fresh_comments = self.subreddit.get_comments(params={'before': self.get_most_recent_comment()},
-                                                     limit=None)
+        fresh_comments = self.subreddit.get_comments(
+            params={'before': self.get_most_recent_comment()}, limit=None)
 
         for comment in fresh_comments:
-            self.scan_comment(comment)
-            if not self.scanned_comments or comment.name > self.scanned_comments[-1]:
+            self.process_comment(comment)
+            if (not self.scanned_comments) or (comment.name > self.scanned_comments[-1]):
                 self.scanned_comments.append(comment.name)
 
-    def command_add(self, message_body, strict):
-        ids = re.findall(self.comment_id_regex, message_body)
-        for id in ids:
-            comment = self.reddit.get_info(thing_id='t1_%s' % id)
+    def rescan_comments(self):
+        """Rescan comments with rescannable dispos"""
+        logging.info("Rescanning comments")
+
+        recent_logs = self.db.fetch_recent_dispo_logs(self.config.days_to_rescan)
+        rescannable_logs = [log for log in recent_logs 
+            if log['dispo'] in rescannable_dispos]
+
+        for log in rescannable_logs:
+            comment = self.reddit.get_info(thing_id='t1_'+log['comment_id'])
+            self.process_comment(comment, log)
+
+    def extract_comment_ids(self, message_body):
+        comment_id_regex = ('(?:http://)?(?:www\.)?reddit\.com/r(?:eddit)?/' +
+            self.config.subreddit + '/comments/[\d\w]+(?:/[^/]+)/?([\d\w]+)')
+        return re.findall(comment_id_regex, message_body)
+
+    def command_rescan(self, message_body, strict=True):
+        comment_ids = self.extract_comment_ids(message_body)
+        for comment_id in comment_ids:
+            comment = self.reddit.get_info(thing_id='t1_'+comment_id)
             if type(comment) is praw.objects.Comment:
-                self.scan_comment(comment, strict=strict)
+                self.process_comment(comment, strict=strict)
 
     def is_moderator(self, name):
         moderators = self.reddit.get_moderators(self.config.subreddit)
@@ -365,30 +370,29 @@ class DeltaBot(object):
         return name in mod_names
 
     def scan_message(self, message):
-        logging.info("Scanning message %s from %s" % (message.name,
-                                                      message.author))
+        logging.info("Scanning message {} from {}".format(
+            message.name, message.author))
+
         if self.is_moderator(message.author.name):
             command = message.subject.lower()
             if command == "force add":
                 self.reddit.send_message("/r/" + self.config.subreddit,
-                                         "Force Add Detected",
-                                         "The Force Add command has been used "
-                                         "on the following link(s):\n\n" + \
-                                         message.body)
+                    "Force Add Detected", 
+                    ("The Force Add command has been used on the following link(s):\n\n" +
+                    message.body))
+
             if command == "add" or command == "force add":
                 strict = (command != "force add")
-                self.command_add(message.body, strict)
-                self.reddit.send_message(message.author,
-                                         "Add complete",
-                                         "The add command has been "
-                                         "completed on: " + message.body)
+                self.command_rescan(message.body, strict=strict)
+                self.reddit.send_message(message.author, "Add complete",
+                    "The add command has been completed on: " + message.body)
 
             elif command == "remove":
                 # Todo
                 pass
 
             elif command == "rescan":
-                self.rescan_comments(message.body)
+                self.command_rescan(message.body)
 
             elif command == "reset":
                 self.scanned_comments.clear()
@@ -436,10 +440,10 @@ class DeltaBot(object):
             new_css = ' '.join(filter(None, [current_css, new_class]))
             self.subreddit.set_flair(leader, flair_text=flair_text, flair_css_class=new_css)
 
-    def update_scoreboard(self, leaders, month):
+    def update_sidebar_scoreboard(self, leaders, month):
         """ Update the top 10 list with highest scores. """
         logging.info("Updating scoreboard")
-        score_table = self.scoreboard_template.render(leaders=leaders, 
+        score_table = self.templates['sidebar_scoreboard'].render(leaders=leaders, 
             month=month)
 
         settings = self.subreddit.get_settings()
@@ -453,6 +457,9 @@ class DeltaBot(object):
         self.subreddit.update_settings(description=new_desc)
 
     def update_wiki_tracker(self, awardee, awards):
+        """ Update the wiki tracker page for an individual """
+        logging.info('Updating wiki page for user {}'.format(awardee))
+        # munge the raw awards data into a form suitable for rendering
         awarded_comments = []
         for awarded_comment_id in set([award['awarded_comment_id']
                 for award in awards]):
@@ -464,48 +471,30 @@ class DeltaBot(object):
                 {key.replace('awarding_comment_', ''): award_for_comment[key] 
                 for key in award_for_comment.keys() if 'awarding' in key} for 
                 award_for_comment in awards_for_comment]
-            awarded_comment['awarding_comments'].sort(key=lambda x: x['datetime'])
+            awarded_comment['awarding_comments'].sort(key=lambda x: x['time'])
             awarded_comments.append(awarded_comment)
 
-        new_content = self.user_wiki_template.render(awarde=awardee, 
-            num_awards=len(awards), awarded_comments=awarded_comments)
+        new_content = self.templates['user_wiki_page'].render(awarde=awardee, 
+            num_awards=len(awards), awarded_comments=awarded_comments, dt=datetime)
         self.reddit.edit_wiki_page(self.config.subreddit, "user/" + awardee, 
             new_content, "Updated awards.")
 
-    def fetch_awards_by_awardee(self, awardee):
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute('''SELECT * FROM awards WHERE 
-                awarded_comment_author=?''', (awardee,))
-            awards = cur.fetchall()
-        awards = [dict(award) for award in awards]
-        for award in awards:
-            for key in [key for key in award.keys() if 'datetime' in key]:
-                award[key] = datetime.strptime(award[key],
-                    '%Y-%m-%d %H:%M:%S')
-        return awards
-
-    def fetch_awards_by_month(self, year, month):
-        next_month = (month + 1) if (month < 12) else 1
-        next_year = year if (next_month > 1) else (year + 1)
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute('''SELECT * FROM awards WHERE 
-                (awarding_comment_datetime >= ? 
-                AND awarding_comment_datetime < ?)''', 
-                (datetime(year, month, 1, 0, 0, 0), 
-                 datetime(next_year, next_month, 1, 0, 0, 0)))
-            awards = cur.fetchall()
-        awards = [dict(award) for award in awards]
-        for award in awards:
-            for key in [key for key in award.keys() if 'datetime' in key]:
-                award[key] = datetime.strptime(award[key],
-                    '%Y-%m-%d %H:%M:%S')
-        return awards
-
     def find_top_n(self, awards, n):
-        return collections.Counter([award['awarded_comment_author'] 
+
+        def find_earliest_award(awardee):
+            awardee_awards = [award for award in awards if 
+                award['awarded_comment_author'] == awardee]
+            awardee_awards.sort(key=lambda x: x['awarded_comment_time'])
+            return awardee_awards[0]['awarded_comment_time']
+
+        top_awardees = collections.Counter([award['awarded_comment_author'] 
             for award in awards]).most_common(n)
+        tops = [
+            {'awardee': awardee[0], 
+             'num_awards': awardee[1], 
+             'earliest_award_time': find_earliest_award(awardee[0])} 
+            for awardee in top_awardees]
+        return sorted(tops, key=lambda x: (x['num_awards'], -x['earliest_award_time']))
 
     def clear_leader_flair_css(self):
         top_csses = [value for key, value in self.config.flair.items()
@@ -522,30 +511,6 @@ class DeltaBot(object):
             self.subreddit.set_flair(flair['user'], 
                 flair_text=flair['flair_text'], flair_css_class=new_flair_class)
 
-    def rescan_comments(self):
-        """Rescan comments that did not originally contain enough text"""
-        logging.info("Rescanning comments")
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute('''FROM rescannable SELECT *''')
-            rescans = cur.fetchall()
-
-        for rescan in rescans:
-            comment = self.reddit.get_info(thing_id=('t1_' + rescan['comment_id']))
-            if self.is_comment_too_short(orig_comment) and not self.is_parent_commenter_author(orig_comment, awardees_comment) and not self.points_already_awarded_to_ancestor(orig_comment, awardees_comment):
-                parent = self.reddit.get_info(thing_id=comment.parent_id)
-                self.award_points(parent.author.name, comment)
-            message = self.get_message('confirmation') % (awardee, 
-                self.config.subreddit, awardee)
-            bots_comment.edit(message).distinguish()
-
-    def clear_old_rescannables(self):
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute('''DELETE FROM rescannable WHERE 
-                comment_datetime < ?''', 
-                (datetime.utcnow() - timedelta(days=self.config['days_to_rescan']),))
-
     def go(self):
         """ Start DeltaBot. """
         self.running = True
@@ -558,29 +523,30 @@ class DeltaBot(object):
             self.scan_mod_mail()
             self.scan_comments()
 
-            while self.to_update:
-                awardee = self.to_update.pop()
-                awardee_awards = self.fetch_awards_by_awardee(awardee)
+            if reset_counter == 0:
+                self.rescan_comments()
+                
+            awardees = set([comment.author.name for comment in self.awarded_comments])
+            self.awarded_comments.clear()
+            while awardees:
+                awardee = awardees.pop()
+                awards = self.db.fetch_awards_by_awardee(awardee)
 
-                num = len(awardee_awards)
+                num = len(awards)
                 if num == 1:
                     self.send_first_time_message(awardee)
                 self.adjust_point_flair(awardee, num)
-                self.update_wiki_tracker(awardee, awardee_awards)
+                self.update_wiki_tracker(awardee, awards)
 
-                if len(self.to_update) == 0:
+                if len(awardees) == 0:
                     now = datetime.utcnow()
-                    monthly_awards = self.fetch_awards_by_month(now.year, now.month)
+                    monthly_awards = self.db.fetch_awards_by_month(now.year, now.month)
                     self.update_monthly_scoreboard(now.year, now.month, monthly_awards)
                     top10 = self.find_top_n(monthly_awards, 10)
-                    self.update_top_css([leader[0] for leader in top10])
-                    self.update_scoreboard(top10, now.strftime('%b'))
+                    self.update_top_css([top['awardee'] for top in top10])
+                    self.update_sidebar_scoreboard(top10, now.strftime('%b'))
 
-            if reset_counter == 0:
-                self.rescan_comments()
-                self.clear_old_rescannables()
-                
-            if self.scanned_comments and old_comment_id is not self.scanned_comments[-1]:
+            if self.scanned_comments and (old_comment_id is not self.scanned_comments[-1]):
                 write_saved_id(self.config.last_comment_filename,
                                self.scanned_comments[-1])
 

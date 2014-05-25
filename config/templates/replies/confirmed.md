@@ -1,0 +1,1 @@
+Confirmed: 1 ∆ awarded to /u/{{parent_comment.author.name}}. ^[[History](/r/{{ config.subreddit }}/wiki/user/{{ parent_comment.author.name }})]

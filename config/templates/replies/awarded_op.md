@@ -1,0 +1,1 @@
+You cannot award OP a delta as the moderators feel that allowing so would send the wrong message. If you were trying to show the OP how to award a delta, please do so without using the delta symbol unless it's included in a reddit quote.

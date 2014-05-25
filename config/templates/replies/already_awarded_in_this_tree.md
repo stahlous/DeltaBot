@@ -1,0 +1,1 @@
+You have already awarded /u/{{ parent_comment.author.name }} a delta in this comment tree.

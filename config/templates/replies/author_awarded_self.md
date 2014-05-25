@@ -1,0 +1,1 @@
+You can not award a ∆ to yourself.
