@@ -157,7 +157,7 @@ class DeltaBot(object):
             return self.climb_up(parent)
 
     def send_first_time_message(self, awardee):
-        first_time_message = self.config.private_message % (self.config.subreddit, awardee)
+        first_time_message = self.templates['first_award_message'].render(awardee=awardee, config=self.config)
         self.reddit.send_message(awardee,
             self.config.private_message_subject_line, first_time_message)
 
@@ -473,7 +473,7 @@ class DeltaBot(object):
             awarded_comment['awarding_comments'].sort(key=lambda x: x['time'])
             awarded_comments.append(awarded_comment)
 
-        new_content = self.templates['user_wiki_page'].render(awarde=awardee, 
+        new_content = self.templates['user_wiki_page'].render(awardee=awardee, 
             num_awards=len(awards), awarded_comments=awarded_comments, dt=datetime)
         self.reddit.edit_wiki_page(self.config.subreddit, "user/" + awardee, 
             new_content, "Updated awards.")
@@ -525,14 +525,16 @@ class DeltaBot(object):
             if reset_counter == 0:
                 self.rescan_comments()
                 
-            awardees = set([comment.author.name for comment in self.awarded_comments])
-            self.awarded_comments.clear()
+            awardees = set([comment.author.name for comment 
+                in self.awarded_comments])
             while awardees:
                 awardee = awardees.pop()
                 awards = self.db.fetch_awards_by_awardee(awardee)
 
                 num = len(awards)
-                if num == 1:
+                current_awards = [comment for comment in self.awarded_comments 
+                    if comment.author.name == awardee]
+                if num == len(current_awards):
                     self.send_first_time_message(awardee)
                 self.adjust_point_flair(awardee, num)
                 self.update_wiki_tracker(awardee, awards)
@@ -544,6 +546,8 @@ class DeltaBot(object):
                     top10 = self.find_top_n(monthly_awards, 10)
                     self.update_top_css([top['awardee'] for top in top10])
                     self.update_sidebar_scoreboard(top10, now.strftime('%b'))
+
+            self.awarded_comments.clear()
 
             if self.scanned_comments and (old_comment_id is not self.scanned_comments[-1]):
                 write_saved_id(self.config.last_comment_filename,
